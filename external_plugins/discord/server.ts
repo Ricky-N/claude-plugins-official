@@ -819,6 +819,8 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 })
 
 client.on('messageCreate', msg => {
+  const channelName = 'name' in msg.channel ? (msg.channel as any).name : 'DM'
+  process.stderr.write(`discord: messageCreate from ${msg.author.username} in #${channelName} (bot=${msg.author.bot})\n`)
   if (msg.author.bot) {
     // Allow bot messages in guild channels that have allowBotMessages: true
     if (msg.channel.type === ChannelType.DM) return
@@ -827,13 +829,18 @@ client.on('messageCreate', msg => {
       : msg.channelId
     const access = loadAccess()
     const policy = access.groups[channelId]
-    if (!policy?.allowBotMessages) return
+    if (!policy?.allowBotMessages) {
+      process.stderr.write(`discord: dropping bot message — allowBotMessages not set for ${channelId}\n`)
+      return
+    }
+    process.stderr.write(`discord: allowing bot message in ${channelId} (allowBotMessages=true)\n`)
   }
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
 async function handleInbound(msg: Message): Promise<void> {
   const result = await gate(msg)
+  process.stderr.write(`discord: gate result for ${msg.author.username}: action=${result.action}\n`)
 
   if (result.action === 'drop') return
 
@@ -893,6 +900,7 @@ async function handleInbound(msg: Message): Promise<void> {
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
 
+  process.stderr.write(`discord: delivering to Claude — user=${msg.author.username} chat_id=${chat_id} content_length=${content.length}\n`)
   mcp.notification({
     method: 'notifications/claude/channel',
     params: {
@@ -906,6 +914,8 @@ async function handleInbound(msg: Message): Promise<void> {
         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
       },
     },
+  }).then(() => {
+    process.stderr.write(`discord: notification sent successfully for msg ${msg.id}\n`)
   }).catch(err => {
     process.stderr.write(`discord channel: failed to deliver inbound to Claude: ${err}\n`)
   })
@@ -913,7 +923,13 @@ async function handleInbound(msg: Message): Promise<void> {
 
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+  process.stderr.write(`discord channel: guilds=${c.guilds.cache.size} channels=${c.channels.cache.size}\n`)
+  const access = loadAccess()
+  const groupCount = Object.keys(access.groups).length
+  process.stderr.write(`discord channel: access config loaded — ${groupCount} channel groups, allowFrom=${JSON.stringify(access.allowFrom)}\n`)
 })
+
+process.stderr.write(`discord channel: MCP server created, connecting transport...\n`)
 
 client.login(TOKEN).catch(err => {
   process.stderr.write(`discord channel: login failed: ${err}\n`)
