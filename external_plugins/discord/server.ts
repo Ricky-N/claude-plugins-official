@@ -84,9 +84,11 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessageReactions,
   ],
   // DMs arrive as partial channels — messageCreate never fires without this.
-  partials: [Partials.Channel],
+  // Reaction + Message partials let us receive reactions on uncached messages.
+  partials: [Partials.Channel, Partials.Reaction, Partials.Message],
 })
 
 type PendingEntry = {
@@ -127,6 +129,7 @@ function extractEmbedText(embeds: Message['embeds']): string {
   if (embeds.length === 0) return ''
   return embeds.map(e => {
     const parts: string[] = []
+    if (e.author?.name) parts.push(e.author.name)
     if (e.title) parts.push(e.title)
     if (e.description) parts.push(e.description.replace(/[\r\n]+/g, ' ⏎ '))
     if (e.fields?.length) {
@@ -136,6 +139,10 @@ function extractEmbedText(embeds: Message['embeds']): string {
     return parts.join(' | ')
   }).join(' ⏎ ')
 }
+
+/** Track bot messages delivered with empty embeds so we can re-deliver
+ *  when messageUpdate fires with the resolved embed content. */
+const pendingEmbedMessages = new Map<string, { chatId: string; username: string; userId: string; ts: string }>()
 
 function defaultAccess(): Access {
   return {
@@ -846,6 +853,134 @@ client.on('messageCreate', msg => {
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
+// Re-deliver bot messages when Discord resolves embeds after messageCreate.
+// GitHub, Sentry, and other webhook integrations often fire messageCreate with
+// empty embeds, then send messageUpdate once the embed content is resolved.
+client.on('messageUpdate', (_oldMsg, newMsg) => {
+  if (!newMsg.author?.bot) return
+  const pending = pendingEmbedMessages.get(newMsg.id)
+  if (!pending) return
+
+  const embeds = newMsg.embeds ?? []
+  const embedText = extractEmbedText(embeds)
+  if (!embedText) return // Still empty — wait for another update
+
+  pendingEmbedMessages.delete(newMsg.id)
+  const content = newMsg.content ? `${newMsg.content}\n[embed] ${embedText}` : embedText
+
+  process.stderr.write(`discord: messageUpdate resolved embeds for ${newMsg.id} — delivering (${content.length} chars)\n`)
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content,
+      meta: {
+        chat_id: pending.chatId,
+        message_id: newMsg.id,
+        user: pending.username,
+        user_id: pending.userId,
+        ts: pending.ts,
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`discord channel: failed to deliver embed-update for ${newMsg.id}: ${err}\n`)
+  })
+})
+
+// Surface emoji reactions in channels we monitor. Knowing that a human
+// acknowledged (or flagged) a message is signal — it tells us something was
+// seen, agreed with, or needs attention.
+client.on('messageReactionAdd', async (reaction, user) => {
+  // Partial reactions arrive for uncached messages — fetch the full data.
+  if (reaction.partial) {
+    try { reaction = await reaction.fetch() } catch { return }
+  }
+  if (user.partial) {
+    try { user = await user.fetch() } catch { return }
+  }
+  if (user.bot) return // Ignore bot reactions (including our own ack reactions)
+
+  const msg = reaction.message
+  const channelId = msg.channel.isThread?.()
+    ? (msg.channel as any).parentId ?? msg.channelId
+    : msg.channelId
+  const access = loadAccess()
+  const policy = access.groups[channelId]
+  if (!policy) return // Not a channel we're monitoring
+
+  const channelName = 'name' in msg.channel ? (msg.channel as any).name : 'unknown'
+  const emoji = reaction.emoji.name ?? '?'
+
+  // Build a short summary of what was reacted to
+  let targetPreview = msg.content?.slice(0, 120) || ''
+  if (!targetPreview && msg.embeds?.length) {
+    targetPreview = extractEmbedText(msg.embeds).slice(0, 120)
+  }
+  if (targetPreview.length >= 120) targetPreview += '…'
+
+  const content = `${user.username} reacted ${emoji} to: ${targetPreview || '(message)'}`
+  process.stderr.write(`discord: reaction ${emoji} by ${user.username} in #${channelName}\n`)
+
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content,
+      meta: {
+        chat_id: channelId,
+        message_id: msg.id,
+        user: user.username,
+        user_id: user.id,
+        ts: new Date().toISOString(),
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`discord channel: failed to deliver reaction: ${err}\n`)
+  })
+})
+
+// Auto-join threads created in channels we monitor so we receive messages
+// inside them. Without this, threaded conversations are invisible.
+client.on('threadCreate', async (thread, newlyCreated) => {
+  const parentId = thread.parentId
+  if (!parentId) return
+  const access = loadAccess()
+  const policy = access.groups[parentId]
+  if (!policy) return // Thread's parent isn't a channel we monitor
+
+  const channelName = thread.name ?? 'unknown'
+  process.stderr.write(`discord: thread "${channelName}" created in monitored channel ${parentId} — joining\n`)
+
+  try {
+    if (!thread.joined) await thread.join()
+  } catch (err) {
+    process.stderr.write(`discord: failed to join thread ${thread.id}: ${err}\n`)
+    return
+  }
+
+  if (newlyCreated) {
+    const content = `New thread created: "${channelName}"`
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content,
+        meta: {
+          chat_id: parentId,
+          message_id: thread.id,
+          user: 'system',
+          user_id: '0',
+          ts: thread.createdAt?.toISOString() ?? new Date().toISOString(),
+        },
+      },
+    }).catch(err => {
+      process.stderr.write(`discord channel: failed to deliver thread-create: ${err}\n`)
+    })
+  }
+})
+
+// Surface Discord.js warnings — rate limit pressure, missing permissions, etc.
+client.on('warn', warning => {
+  process.stderr.write(`discord channel: WARN: ${warning}\n`)
+})
+
 async function handleInbound(msg: Message): Promise<void> {
   const result = await gate(msg)
   process.stderr.write(`discord: gate result for ${msg.author.username}: action=${result.action}\n`)
@@ -916,6 +1051,21 @@ async function handleInbound(msg: Message): Promise<void> {
   }
 
   if (!content && atts.length > 0) content = '(attachment)'
+
+  // Track bot messages delivered without embed content — messageUpdate will
+  // re-deliver once Discord resolves the embeds.
+  if (msg.author.bot && msg.embeds.length === 0 && !msg.content) {
+    pendingEmbedMessages.set(msg.id, {
+      chatId: chat_id,
+      username: msg.author.username,
+      userId: msg.author.id,
+      ts: msg.createdAt.toISOString(),
+    })
+    // Auto-expire after 30s — if embeds haven't resolved by then, they won't.
+    setTimeout(() => pendingEmbedMessages.delete(msg.id), 30_000)
+    process.stderr.write(`discord: bot message ${msg.id} has no embeds yet — tracking for messageUpdate\n`)
+    return // Don't deliver empty message; wait for embed resolution
+  }
 
   process.stderr.write(`discord: delivering to Claude — user=${msg.author.username} chat_id=${chat_id} content_length=${content.length}\n`)
   mcp.notification({
