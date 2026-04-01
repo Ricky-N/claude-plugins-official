@@ -120,6 +120,23 @@ type Access = {
   chunkMode?: 'length' | 'newline'
 }
 
+/** Extract human-readable text from Discord embeds.
+ *  Used by both fetch_messages and live inbound notifications so the model
+ *  sees consistent data regardless of how it encounters a message. */
+function extractEmbedText(embeds: Message['embeds']): string {
+  if (embeds.length === 0) return ''
+  return embeds.map(e => {
+    const parts: string[] = []
+    if (e.title) parts.push(e.title)
+    if (e.description) parts.push(e.description.replace(/[\r\n]+/g, ' ⏎ '))
+    if (e.fields?.length) {
+      for (const f of e.fields) parts.push(`${f.name}: ${f.value}`)
+    }
+    if (e.footer?.text) parts.push(e.footer.text)
+    return parts.join(' | ')
+  }).join(' ⏎ ')
+}
+
 function defaultAccess(): Access {
   return {
     dmPolicy: 'pairing',
@@ -675,17 +692,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                   let text = m.content.replace(/[\r\n]+/g, ' ⏎ ')
                   // Extract embed content — bot messages (Sentry, GitHub, etc.)
                   // use embeds instead of content.
-                  if (m.embeds.length > 0) {
-                    const embedText = m.embeds.map(e => {
-                      const parts: string[] = []
-                      if (e.title) parts.push(e.title)
-                      if (e.description) parts.push(e.description.replace(/[\r\n]+/g, ' ⏎ '))
-                      if (e.fields?.length) {
-                        for (const f of e.fields) parts.push(`${f.name}: ${f.value}`)
-                      }
-                      if (e.footer?.text) parts.push(e.footer.text)
-                      return parts.join(' | ')
-                    }).join(' ⏎ ')
+                  const embedText = extractEmbedText(m.embeds)
+                  if (embedText) {
                     text = text ? `${text} ⏎ [embed] ${embedText}` : embedText
                   }
                   return `[${m.createdAt.toISOString()}] ${who}: ${text}  (id: ${m.id}${atts})`
@@ -898,7 +906,16 @@ async function handleInbound(msg: Message): Promise<void> {
 
   // Attachment listing goes in meta only — an in-content annotation is
   // forgeable by any allowlisted sender typing that string.
-  const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
+  let content = msg.content || ''
+
+  // Extract embed content for bot messages — GitHub, Sentry, Google Cloud,
+  // etc. use embeds instead of message content.
+  const embedText = extractEmbedText(msg.embeds)
+  if (embedText) {
+    content = content ? `${content}\n[embed] ${embedText}` : embedText
+  }
+
+  if (!content && atts.length > 0) content = '(attachment)'
 
   process.stderr.write(`discord: delivering to Claude — user=${msg.author.username} chat_id=${chat_id} content_length=${content.length}\n`)
   mcp.notification({
